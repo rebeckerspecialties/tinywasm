@@ -9,12 +9,15 @@
 //! canonical-ABI-shaped values in a selected wasm32 linear memory. The memory
 //! is supplied explicitly: canonical ABI memories need not be named `memory`.
 //!
-//! Only UTF-8 strings, `list<u8>`, and `list<u32>` are covered here. Full
-//! component values, resource handles, `realloc`, post-return, and async calls
-//! require further work. Per-transfer bounds do not replace store fuel, memory
-//! limits, or per-instance resource quotas.
+//! Memory helpers cover UTF-8 strings, `list<u8>`, and `list<u32>`. The
+//! [`resources`] module supplies a separate, bounded host resource table for
+//! custom imports. Neither implements canonical component handle lifting,
+//! borrow scopes, `realloc`, post-return, or async calls. Per-transfer bounds
+//! do not replace store fuel, memory limits, or per-instance resource quotas.
 
 extern crate alloc;
+
+pub mod resources;
 
 use alloc::string::ToString;
 use core::fmt;
