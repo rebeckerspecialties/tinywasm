@@ -8,9 +8,12 @@ interpreter nor the WASI Preview 1 calling path depends on it.
 
 This is **not** a component runtime. It does not parse or instantiate
 components, implement WASI Preview 2/3 modules, call `realloc`, manage resource
-handles, or bridge async calls. It is a small foundation for custom WIT host
-modules; full components and cross-language async can be built incrementally
-without making Preview 1 users pay for them.
+handles through canonical lifting, or bridge async calls. A separate bounded
+host resource table supports typed, generation-checked raw handles in custom
+imports. It is not the component instance's canonical handle table and does
+not yet implement `own`/`borrow` transfer scopes. It is a small foundation for
+custom WIT host modules; full components and cross-language async can be built
+incrementally without making Preview 1 users pay for them.
 
 Hosts still need store fuel/time limits, memory/resource quotas, and their own
 total-work budgets. The byte limit here applies to each transfer only.
