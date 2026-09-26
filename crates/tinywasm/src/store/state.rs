@@ -29,7 +29,32 @@ pub(crate) struct State {
 // Dispatch once per operation, keeping ordinary memory on the direct-access path.
 // A shared memory runs the body out of line, under its lock, so the handlers of
 // ordinary memory accesses contain no lock/unlock calls and spill no registers for them.
+// Atomic operations, whose memory is usually shared, keep the lock inline with
+// `with_memory!(@lock_inline ...)`.
 macro_rules! with_memory {
+    (@lock_inline $state:expr, $addr:expr, |$memory:ident, $kind:ident| $body:block) => {{
+        let state = &mut $state;
+        let addr = $addr;
+        #[cfg(feature = "std")]
+        let mut guard;
+        #[cfg(feature = "std")]
+        let (kind, bytes) = if addr & $crate::store::SHARED_MEM_BIT != 0 {
+            guard = state.shared_memories[(addr & !$crate::store::SHARED_MEM_BIT) as usize].lock();
+            (guard.kind, &mut *guard.inner)
+        } else {
+            let ordinary = &mut state.memories[addr as usize];
+            (ordinary.kind, &mut ordinary.inner)
+        };
+        #[cfg(not(feature = "std"))]
+        let (kind, bytes) = {
+            let ordinary = state.get_mem_mut(addr);
+            (ordinary.kind, &mut ordinary.inner)
+        };
+        #[allow(unused_variables)]
+        let $kind = kind;
+        let $memory = bytes;
+        $body
+    }};
     ($state:expr, $addr:expr, |$memory:ident, $kind:ident| $body:block) => {{
         let state = &mut $state;
         let addr = $addr;
