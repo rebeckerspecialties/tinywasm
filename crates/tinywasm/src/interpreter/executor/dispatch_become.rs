@@ -5,7 +5,7 @@ struct Bounded;
 
 type UnbudgetedHandler = for<'store, 'module> fn(
     &mut Executor<'store, 'module>,
-    &[Instruction],
+    &'module [Instruction],
     FuncAddr,
     usize,
     Instruction,
@@ -34,9 +34,9 @@ macro_rules! define_unbudgeted_tail_dispatch {
 
         $(
             #[allow(non_snake_case, unreachable_code, unused_imports, unused_macros, unused_variables)]
-            fn $variant(
-                $executor: &mut Executor<'_, '_>,
-                instructions: &[Instruction],
+            fn $variant<'module>(
+                $executor: &mut Executor<'_, 'module>,
+                instructions: &'module [Instruction],
                 func_addr: FuncAddr,
                 $instr_ptr: usize,
                 instruction: Instruction,
@@ -54,17 +54,19 @@ macro_rules! define_unbudgeted_tail_dispatch {
                         match $flow.next_instr_ptr() {
                             Some(next_instr_ptr) => {
                                 if $executor.cf.func_addr != func_addr {
-                                    $executor.cf.instr_ptr = next_instr_ptr;
-                                    return Ok(());
+                                    // A call, return or caught exception moved to another function
+                                    // of this module instance, whose body the executor borrows
+                                    // for the whole run.
+                                    let func = $executor.func;
+                                    let instructions = &func.instructions;
+                                    let func_addr = $executor.cf.func_addr;
+                                    let instruction = instructions[next_instr_ptr];
+                                    let handler = Self::handler_for(instruction.opcode());
+                                    become handler($executor, instructions, func_addr, next_instr_ptr, instruction);
                                 }
                                 $dispatch_next!(next_instr_ptr)
                             },
-                            None => return cold!({
-                                if !$executor.left {
-                                    $executor.completed = true;
-                                }
-                                Ok(())
-                            }),
+                            None => return cold!(Ok(())),
                         }
                     }};
                 }
@@ -168,18 +170,14 @@ impl Executor<'_, '_> {
     /// Runs until the call completes (`None`) or continues in another module instance's frame.
     #[inline(always)]
     pub(crate) fn run_to_completion(mut self) -> Result<Option<CallFrame>> {
-        loop {
-            let func = self.func;
-            let instructions = &func.instructions;
-            let func_addr = self.cf.func_addr;
-            let instr_ptr = self.cf.instr_ptr;
-            let instruction = instructions[instr_ptr];
-            let handler = Unbudgeted::handler_for(instruction.opcode());
-            handler(&mut self, instructions, func_addr, instr_ptr, instruction)?;
-            if self.completed || self.left {
-                return Ok(self.left());
-            }
-        }
+        let func = self.func;
+        let instructions = &func.instructions;
+        let func_addr = self.cf.func_addr;
+        let instr_ptr = self.cf.instr_ptr;
+        let instruction = instructions[instr_ptr];
+        let handler = Unbudgeted::handler_for(instruction.opcode());
+        handler(&mut self, instructions, func_addr, instr_ptr, instruction)?;
+        Ok(self.left())
     }
 
     /// Runs `chunk_left` instructions, then checkpoint by checkpoint until `time_budget` has
