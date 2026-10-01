@@ -33,6 +33,11 @@ pub(crate) struct Stack<T: Copy + Default> {
     dynamic: bool,
 }
 
+/// Whether reads, writes and truncations check the height, as debug builds and the
+/// `checked-stack` feature do. CI runs the tests optimized with debug assertions, keeping the
+/// release profile's wrapping arithmetic, and in release with the feature.
+const CHECKED: bool = cfg!(any(debug_assertions, feature = "checked-stack"));
+
 /// The most slots [`Stack::enter_locals`] writes ahead of the pushes that reach them.
 const WRITTEN_RESERVATION: usize = 64;
 
@@ -127,41 +132,57 @@ impl<T: Copy + Default> Stack<T> {
         Ok(())
     }
 
-    /// Pops the top value. On an empty stack the index wraps around, so the bounds check in
-    /// [`Self::get`] also catches an underflow.
+    /// Pops the top value. On an empty stack the index wraps around, so the bounds check also
+    /// catches an underflow.
     #[inline(always)]
     pub(crate) fn pop(&mut self) -> T {
         let index = self.len.wrapping_sub(1);
-        let value = *self.get(index);
+        let value = *self.top(index);
         self.len = index;
         value
     }
 
     #[inline(always)]
     pub(crate) fn last(&self) -> &T {
-        self.get(self.len.wrapping_sub(1))
+        self.top(self.len.wrapping_sub(1))
     }
 
-    /// The slot at `index`, which validation keeps below the height. The check is against the
-    /// slots in use at any height, which is what memory safety needs. Builds with debug assertions
-    /// also check the height, and CI runs the tests optimized with them, with the release profile's
-    /// wrapping arithmetic.
+    /// The top slot, `index` being the height minus one: below the height unless the height is 0,
+    /// when `index` wraps around past every slot.
     #[inline(always)]
-    pub(crate) fn get(&self, index: usize) -> &T {
-        debug_assert!(index < self.len);
+    fn top(&self, index: usize) -> &T {
         match self.data.get(index) {
             Some(value) => value,
             None => crate::invariant_violated("value stack index out of range"),
         }
     }
 
+    /// The slot at `index`, which validation keeps below the height. Every build checks it against
+    /// the slots the stack has, which is what memory safety needs. [`CHECKED`] builds also check it
+    /// against the height, so a wrong index cannot read a stale slot above it.
+    #[inline(always)]
+    pub(crate) fn get(&self, index: usize) -> &T {
+        match self.data.get(index) {
+            Some(value) if Self::in_height(index, self.len) => value,
+            _ => crate::invariant_violated("value stack read above the height"),
+        }
+    }
+
+    /// Like [`Self::get`]. A write above the height would be overwritten before it is read, but it
+    /// means an index went wrong, so checked builds stop there too.
     #[inline(always)]
     pub(crate) fn set(&mut self, index: usize, value: T) {
-        debug_assert!(index < self.len);
+        let in_height = Self::in_height(index, self.len);
         match self.data.get_mut(index) {
-            Some(slot) => *slot = value,
-            None => crate::invariant_violated("value stack index out of range"),
+            Some(slot) if in_height => *slot = value,
+            _ => crate::invariant_violated("value stack write above the height"),
         }
+    }
+
+    /// Whether `index` is below the height `len`, in [`CHECKED`] builds; always true otherwise.
+    #[inline(always)]
+    fn in_height(index: usize, len: usize) -> bool {
+        !CHECKED || index < len
     }
 
     #[inline(always)]
@@ -173,7 +194,9 @@ impl<T: Copy + Default> Stack<T> {
     #[inline(always)]
     pub(crate) fn truncate_keep(&mut self, n: usize, end_keep: usize) {
         let len = self.len;
-        debug_assert!(n <= len);
+        if CHECKED && n > len {
+            crate::invariant_violated("value stack truncated above the height");
+        }
         if n >= len {
             return;
         }
@@ -189,15 +212,21 @@ impl<T: Copy + Default> Stack<T> {
         self.len = n.wrapping_add(keep);
     }
 
+    /// Lowers the height to `n`. In [`CHECKED`] builds a target above the height stops here: it
+    /// would bring stale slots back below the height, where reads no longer catch them.
     #[inline(always)]
     pub(crate) fn truncate_to(&mut self, n: usize) {
-        debug_assert!(n <= self.len);
+        if CHECKED && n > self.len {
+            crate::invariant_violated("value stack truncated above the height");
+        }
         self.len = n;
     }
 
     #[inline(always)]
     pub(crate) fn truncate_to_one_tail(&mut self, n: usize) {
-        debug_assert!(n < self.len);
+        if CHECKED && n >= self.len {
+            crate::invariant_violated("value stack truncated above the height");
+        }
         let last = self.pop();
         self.len = n;
         self.push(last);
@@ -425,7 +454,7 @@ mod tests {
     use super::*;
 
     /// A stack of height 2 whose third slot still holds a popped value.
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, all(feature = "checked-stack", not(feature = "nightly-tail-calls"))))]
     fn popped() -> Stack<Value32> {
         let mut stack = Stack::new(StackConfig::fixed(8));
         for value in [1, 2, 3] {
@@ -435,18 +464,26 @@ mod tests {
         stack
     }
 
+    // A release tail-call build aborts on a broken invariant, which `should_panic` cannot catch.
     #[test]
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, all(feature = "checked-stack", not(feature = "nightly-tail-calls"))))]
     #[should_panic]
     fn get_above_the_height() {
         popped().get(2);
     }
 
     #[test]
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, all(feature = "checked-stack", not(feature = "nightly-tail-calls"))))]
     #[should_panic]
     fn set_above_the_height() {
         popped().set(2, 0);
+    }
+
+    #[test]
+    #[cfg(any(debug_assertions, all(feature = "checked-stack", not(feature = "nightly-tail-calls"))))]
+    #[should_panic]
+    fn truncate_above_the_height() {
+        popped().truncate_to(3);
     }
 
     /// A large operand-stack reservation is not written: only the locals and the values pushed
