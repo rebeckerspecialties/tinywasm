@@ -132,6 +132,10 @@ guest-debug = []
 # use explicit tail calls for interpreter dispatch (requires nightly Rust)
 nightly-tail-calls = []
 
+# check value-stack reads, writes and truncations against the stack's height in release builds too,
+# as debug builds do, so an interpreter bug cannot read a stale slot above it (about 1% slower)
+checked-stack = []
+
 # enable x86-specific SIMD intrinsics in Value128 (uses unsafe code)
 # note: for x86 backend selection, compile with x86-64-v3 target features
 # (for example: `RUSTFLAGS="-C target-cpu=x86-64-v3"`)
