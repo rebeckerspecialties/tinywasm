@@ -74,6 +74,11 @@ jobs:
             rust: stable
             name: "Windows x86_64"
             target: x86_64-pc-windows-msvc
+          - os: windows-2025
+            rust: nightly
+            name: "Windows x86_64 (nightly tail calls)"
+            target: x86_64-pc-windows-msvc
+            args: "--features tinywasm/nightly-tail-calls"
           - os: ubuntu-26.04-arm
             rust: stable
             name: "Linux arm64"
