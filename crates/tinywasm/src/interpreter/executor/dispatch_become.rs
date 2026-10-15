@@ -13,14 +13,21 @@ struct Bounded;
 // On arm64_32 (watchOS) the Rust ABI passes an aggregate larger than a pointer, the 8-byte
 // `Instruction`, by reference, so every dispatch would store it and the next handler load it back.
 // The C convention passes it in a register; `C-unwind` still lets a host function's panic unwind.
-// Elsewhere the handlers keep the Rust ABI, which passes eight integer arguments in registers on
-// arm64, six on x86-64 System V (as many as the Unbudgeted handlers take) and four on Windows x64.
+// On Windows x64 the handlers use the System V convention (`sysv64-unwind`), which passes six
+// integer arguments in registers where Windows' own passes four, so a dispatch no longer stores the
+// height for the next handler to load back. The `Instruction` still goes through the stack there:
+// the System V rules pass this enum in memory. Elsewhere the handlers keep the Rust ABI, which
+// passes eight integer arguments in registers on arm64 and six on x86-64 System V, with the
+// `Instruction` in one of them.
 macro_rules! handler_fn {
     ($(#[$meta:meta])* fn $($rest:tt)*) => {
         #[cfg(all(target_arch = "aarch64", target_pointer_width = "32"))]
         #[allow(improper_ctypes_definitions)]
         $(#[$meta])* extern "C-unwind" fn $($rest)*
-        #[cfg(not(all(target_arch = "aarch64", target_pointer_width = "32")))]
+        #[cfg(all(target_arch = "x86_64", windows))]
+        #[allow(improper_ctypes_definitions)]
+        $(#[$meta])* extern "sysv64-unwind" fn $($rest)*
+        #[cfg(not(any(all(target_arch = "aarch64", target_pointer_width = "32"), all(target_arch = "x86_64", windows))))]
         $(#[$meta])* fn $($rest)*
     };
 }
@@ -37,7 +44,9 @@ macro_rules! handler_types {
 }
 #[cfg(all(target_arch = "aarch64", target_pointer_width = "32"))]
 handler_types!("C-unwind");
-#[cfg(not(all(target_arch = "aarch64", target_pointer_width = "32")))]
+#[cfg(all(target_arch = "x86_64", windows))]
+handler_types!("sysv64-unwind");
+#[cfg(not(any(all(target_arch = "aarch64", target_pointer_width = "32"), all(target_arch = "x86_64", windows))))]
 handler_types!();
 
 macro_rules! define_unbudgeted_tail_dispatch {
