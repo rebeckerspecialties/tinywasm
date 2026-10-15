@@ -81,15 +81,51 @@ macro_rules! handler_types {
 }
 #[cfg(all(target_arch = "aarch64", target_pointer_width = "32"))]
 #[allow(improper_ctypes_definitions)]
-type BoundedHandler = for<'store, 'module> extern "C-unwind" fn(&mut Executor<'store, 'module>, usize, Instruction, u32, BoundedHeight) -> ExecResult<()>;
+type BoundedHandler = for<'store, 'module> extern "C-unwind" fn(&mut Executor<'store, 'module>, BoundedInstructions<'_>, usize, Instruction, u32, BoundedHeight) -> ExecResult<()>;
 #[cfg(not(all(target_arch = "aarch64", target_pointer_width = "32")))]
-type BoundedHandler = for<'store, 'module> fn(&mut Executor<'store, 'module>, usize, Instruction, u32, BoundedHeight) -> ExecResult<()>;
+type BoundedHandler = for<'store, 'module> fn(&mut Executor<'store, 'module>, BoundedInstructions<'_>, usize, Instruction, u32, BoundedHeight) -> ExecResult<()>;
 #[cfg(all(target_arch = "aarch64", target_pointer_width = "32"))]
 handler_types!("C-unwind");
 #[cfg(all(target_arch = "x86_64", windows))]
 handler_types!("sysv64-unwind");
 #[cfg(not(any(all(target_arch = "aarch64", target_pointer_width = "32"), all(target_arch = "x86_64", windows))))]
 handler_types!();
+
+/// The bounded handlers pass the executing function's instructions on arm64, where the argument
+/// registers hold them along with the rest. Elsewhere they would push an argument onto the stack
+/// (x86-64 passes six on System V and four on Windows), so there the handlers pass nothing and
+/// read the instructions through the executor.
+#[cfg(target_arch = "aarch64")]
+type BoundedInstructions<'a> = &'a [Instruction];
+#[cfg(not(target_arch = "aarch64"))]
+type BoundedInstructions<'a> = core::marker::PhantomData<&'a [Instruction]>;
+
+/// The executing function's instructions as the bounded handlers pass them.
+#[inline(always)]
+fn bounded_instructions(func: &WasmFunction) -> BoundedInstructions<'_> {
+    #[cfg(target_arch = "aarch64")]
+    return &func.instructions;
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = func;
+        core::marker::PhantomData
+    }
+}
+
+/// The instructions a bounded handler dispatches from.
+#[inline(always)]
+fn bounded_slice<'a>(passed: BoundedInstructions<'a>, func: &'a WasmFunction) -> &'a [Instruction] {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let _ = func;
+        passed
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = passed;
+        &func.instructions
+    }
+}
 
 macro_rules! define_unbudgeted_tail_dispatch {
     ($executor:ident, $instr_ptr:ident, $dispatch_next:ident, $dispatch_flow:ident;
@@ -173,6 +209,7 @@ macro_rules! define_bounded_tail_dispatch {
             #[allow(non_snake_case, unreachable_code, unused_imports, unused_macros, unused_variables)]
             fn $variant(
                 $executor: &mut Executor<'_, '_>,
+                instructions: BoundedInstructions<'_>,
                 $instr_ptr: usize,
                 instruction: Instruction,
                 instructions_until_checkpoint: u32,
@@ -180,6 +217,10 @@ macro_rules! define_bounded_tail_dispatch {
             ) -> ExecResult<()> {
                 macro_rules! $dispatch_next {
                     ($next_instr_ptr:expr) => {{
+                        $dispatch_next!(@in instructions, $next_instr_ptr)
+                    }};
+                    (@in $instructions:expr, $next_instr_ptr:expr) => {{
+                        let instructions: BoundedInstructions<'_> = $instructions;
                         let next_instr_ptr = $next_instr_ptr;
                         let height32 = bounded_height($executor);
                         if instructions_until_checkpoint == 0 {
@@ -189,18 +230,23 @@ macro_rules! define_bounded_tail_dispatch {
                             });
                         }
 
-                        let Some(&next) = $executor.func.instructions.get(next_instr_ptr) else {
-                            become Self::invalid_instr_ptr($executor, next_instr_ptr, instruction, instructions_until_checkpoint, height32);
+                        let Some(&next) = bounded_slice(instructions, $executor.func).get(next_instr_ptr) else {
+                            become Self::invalid_instr_ptr($executor, instructions, next_instr_ptr, instruction, instructions_until_checkpoint, height32);
                         };
                         let handler = Self::handler_for(next.opcode());
-                        become handler($executor, next_instr_ptr, next, instructions_until_checkpoint - 1, height32);
+                        become handler($executor, instructions, next_instr_ptr, next, instructions_until_checkpoint - 1, height32);
                     }};
                 }
                 macro_rules! $dispatch_flow {
                     ($flow:expr) => {{
-                        match $flow.next_instr_ptr() {
-                            Some(next_instr_ptr) => $dispatch_next!(next_instr_ptr),
-                            None => return cold!({
+                        match $flow {
+                            ExecFlow::Next(next_instr_ptr) => $dispatch_next!(next_instr_ptr),
+                            // The step switched functions: continue in the new function's instructions.
+                            ExecFlow::Switch(next_instr_ptr) => {
+                                let func: &WasmFunction = $executor.func;
+                                $dispatch_next!(@in bounded_instructions(func), next_instr_ptr)
+                            }
+                            ExecFlow::Complete => return cold!({
                                 if $executor.left {
                                     $executor.chunk_left = instructions_until_checkpoint;
                                 } else {
@@ -213,10 +259,10 @@ macro_rules! define_bounded_tail_dispatch {
                 }
                 use tinywasm_types::Instruction::*;
                 $(let $variant($($arg),*) = &instruction else {
-                    become Self::handler_mismatch($executor, $instr_ptr, instruction, instructions_until_checkpoint, height32);
+                    become Self::handler_mismatch($executor, instructions, $instr_ptr, instruction, instructions_until_checkpoint, height32);
                 };)?
                 $(let $variant { $($field),* } = &instruction else {
-                    become Self::handler_mismatch($executor, $instr_ptr, instruction, instructions_until_checkpoint, height32);
+                    become Self::handler_mismatch($executor, instructions, $instr_ptr, instruction, instructions_until_checkpoint, height32);
                 };)?
                 enter_bounded_height($executor, height32);
                 $body;
@@ -257,7 +303,7 @@ impl Bounded {
     bounded_handler_fn! {
         #[cold]
         #[inline(never)]
-        fn handler_mismatch(_: &mut Executor<'_, '_>, _: usize, _: Instruction, _: u32, _: BoundedHeight) -> ExecResult<()> {
+        fn handler_mismatch(_: &mut Executor<'_, '_>, _: BoundedInstructions<'_>, _: usize, _: Instruction, _: u32, _: BoundedHeight) -> ExecResult<()> {
             unreachable!("instruction handler mismatch")
         }
     }
@@ -265,7 +311,7 @@ impl Bounded {
     bounded_handler_fn! {
         #[cold]
         #[inline(never)]
-        fn invalid_instr_ptr(_: &mut Executor<'_, '_>, instr_ptr: usize, _: Instruction, _: u32, _: BoundedHeight) -> ExecResult<()> {
+        fn invalid_instr_ptr(_: &mut Executor<'_, '_>, _: BoundedInstructions<'_>, instr_ptr: usize, _: Instruction, _: u32, _: BoundedHeight) -> ExecResult<()> {
             unreachable!("instruction pointer {instr_ptr} out of range, this is a bug")
         }
     }
@@ -273,11 +319,12 @@ impl Bounded {
     /// Runs up to `chunk_left` (at least 1) instructions from `executor.cf`.
     #[inline(always)]
     fn run(executor: &mut Executor<'_, '_>, chunk_left: u32) -> ExecResult<()> {
+        let func: &WasmFunction = executor.func;
         let instr_ptr = executor.cf.instr_ptr;
-        let instruction = executor.func.instructions[instr_ptr];
+        let instruction = func.instructions[instr_ptr];
         let handler = Self::handler_for(instruction.opcode());
         let height32 = bounded_height(executor);
-        handler(executor, instr_ptr, instruction, chunk_left - 1, height32)
+        handler(executor, bounded_instructions(func), instr_ptr, instruction, chunk_left - 1, height32)
     }
 }
 
