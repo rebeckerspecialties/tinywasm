@@ -151,6 +151,10 @@ macro_rules! define_unbudgeted_tail_dispatch {
             ) -> ExecResult<()> {
                 macro_rules! $dispatch_next {
                     ($next_instr_ptr:expr) => {{
+                        $dispatch_next!(@in instructions, $next_instr_ptr)
+                    }};
+                    (@in $instructions:expr, $next_instr_ptr:expr) => {{
+                        let instructions: &[Instruction] = $instructions;
                         let next_instr_ptr = $next_instr_ptr;
                         let height32 = $executor.value_stack.stack_32.len();
                         let Some(&next) = instructions.get(next_instr_ptr) else {
@@ -164,10 +168,11 @@ macro_rules! define_unbudgeted_tail_dispatch {
                     ($flow:expr) => {{
                         match $flow {
                             ExecFlow::Next(next_instr_ptr) => $dispatch_next!(next_instr_ptr),
+                            // The step switched functions: continue in the new function's instructions.
                             ExecFlow::Switch(next_instr_ptr) => {
-                                $executor.cf.instr_ptr = next_instr_ptr;
-                                return Ok(());
-                            },
+                                let func: &WasmFunction = $executor.func;
+                                $dispatch_next!(@in &func.instructions, next_instr_ptr)
+                            }
                             ExecFlow::Complete => return cold!({
                                 if !$executor.left {
                                     $executor.completed = true;
@@ -332,18 +337,15 @@ impl Executor<'_, '_> {
     /// Runs until the call completes (`None`) or continues in another module instance's frame.
     #[inline(always)]
     pub(crate) fn run_to_completion(mut self) -> Result<Option<CallFrame>> {
-        loop {
-            let func = self.func;
-            let instructions = &func.instructions;
-            let instr_ptr = self.cf.instr_ptr;
-            let instruction = instructions[instr_ptr];
-            let handler = Unbudgeted::handler_for(instruction.opcode());
-            let height32 = self.value_stack.stack_32.len();
-            handler(&mut self, instructions, instr_ptr, instruction, height32)?;
-            if self.completed || self.left {
-                return Ok(self.left());
-            }
-        }
+        let func = self.func;
+        let instructions = &func.instructions;
+        let instr_ptr = self.cf.instr_ptr;
+        let instruction = instructions[instr_ptr];
+        let handler = Unbudgeted::handler_for(instruction.opcode());
+        let height32 = self.value_stack.stack_32.len();
+        handler(&mut self, instructions, instr_ptr, instruction, height32)?;
+        debug_assert!(self.completed || self.left);
+        Ok(self.left())
     }
 
     /// Runs `chunk_left` instructions, then checkpoint by checkpoint until `time_budget` has
