@@ -60,6 +60,7 @@ See the [examples](./examples) directory and [documentation](https://docs.rs/tin
 - **`guest-debug`:** Exposes module-internal by-index inspection APIs (`*_by_index`).
 - **`nightly-tail-calls`:** Uses Rust's unstable explicit tail calls for interpreter dispatch. Requires nightly Rust (recommended for maximum performance).
 - **`simd-x86`:** Enables x86-specific SIMD intrinsics and uses `unsafe` internally.
+- **`checked-stack`:** Checks value-stack reads, writes and truncations against the stack's height in release builds too, as debug builds do (about 1% slower).
 
 With default features disabled, `tinywasm` supports `no_std + alloc` and depends only on `libm`.
 
