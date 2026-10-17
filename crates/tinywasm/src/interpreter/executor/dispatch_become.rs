@@ -13,10 +13,12 @@ struct Bounded;
 // On arm64_32 (watchOS) the Rust ABI passes an aggregate larger than a pointer, the 8-byte
 // `Instruction`, by reference, so every dispatch would store it and the next handler load it back.
 // The C convention passes it in a register; `C-unwind` still lets a host function's panic unwind.
-// On Windows x64 the handlers use the System V convention (`sysv64-unwind`), which passes six
-// integer arguments in registers where Windows' own passes four, so a dispatch no longer stores the
-// height for the next handler to load back. The `Instruction` still goes through the stack there:
-// the System V rules pass this enum in memory. Elsewhere the handlers keep the Rust ABI, which
+// On Windows x64 the unbudgeted handlers use the System V convention (`sysv64-unwind`), which
+// passes six integer arguments in registers where Windows' own passes four, so a dispatch no longer
+// stores the height for the next handler to load back. The `Instruction` still goes through the
+// stack there: the System V rules pass this enum in memory. The bounded handlers keep the Rust ABI
+// on Windows x64 and do not pass the height, so their four arguments, the `Instruction` among them,
+// stay in Windows' four argument registers. Elsewhere the handlers keep the Rust ABI, which
 // passes eight integer arguments in registers on arm64 and six on x86-64 System V, with the
 // `Instruction` in one of them.
 macro_rules! handler_fn {
@@ -32,16 +34,56 @@ macro_rules! handler_fn {
     };
 }
 
+macro_rules! bounded_handler_fn {
+    ($(#[$meta:meta])* fn $($rest:tt)*) => {
+        #[cfg(all(target_arch = "aarch64", target_pointer_width = "32"))]
+        #[allow(improper_ctypes_definitions)]
+        $(#[$meta])* extern "C-unwind" fn $($rest)*
+        #[cfg(not(all(target_arch = "aarch64", target_pointer_width = "32")))]
+        $(#[$meta])* fn $($rest)*
+    };
+}
+
+/// The height a bounded handler passes on: nothing on Windows x64.
+#[cfg(not(all(target_arch = "x86_64", windows)))]
+type BoundedHeight = usize;
+#[cfg(all(target_arch = "x86_64", windows))]
+type BoundedHeight = ();
+
+#[inline(always)]
+fn bounded_height(executor: &Executor<'_>) -> BoundedHeight {
+    #[cfg(not(all(target_arch = "x86_64", windows)))]
+    return executor.value_stack.stack_32.len();
+    #[cfg(all(target_arch = "x86_64", windows))]
+    {
+        let _ = executor;
+    }
+}
+
+/// Writes a passed height back to the stack.
+#[inline(always)]
+fn enter_bounded_height(executor: &mut Executor<'_>, height32: BoundedHeight) {
+    #[cfg(not(all(target_arch = "x86_64", windows)))]
+    executor.value_stack.stack_32.set_len(height32);
+    #[cfg(all(target_arch = "x86_64", windows))]
+    {
+        let _ = (executor, height32);
+    }
+}
+
 macro_rules! handler_types {
     ($($abi:literal)?) => {
         // Both sides are Rust, so the C convention's view of these types need not be FFI-safe.
         #[allow(improper_ctypes_definitions)]
         type UnbudgetedHandler =
             for<'store> $(extern $abi)? fn(&mut Executor<'store>, &[Instruction], usize, Instruction, usize) -> ExecResult<()>;
-        #[allow(improper_ctypes_definitions)]
-        type BoundedHandler = for<'store> $(extern $abi)? fn(&mut Executor<'store>, usize, Instruction, u32, usize) -> ExecResult<()>;
     };
 }
+#[cfg(all(target_arch = "aarch64", target_pointer_width = "32"))]
+#[allow(improper_ctypes_definitions)]
+type BoundedHandler = for<'store> extern "C-unwind" fn(&mut Executor<'store>, usize, Instruction, u32, BoundedHeight) -> ExecResult<()>;
+#[cfg(not(all(target_arch = "aarch64", target_pointer_width = "32")))]
+type BoundedHandler = for<'store> fn(&mut Executor<'store>, usize, Instruction, u32, BoundedHeight) -> ExecResult<()>;
 #[cfg(all(target_arch = "aarch64", target_pointer_width = "32"))]
 handler_types!("C-unwind");
 #[cfg(all(target_arch = "x86_64", windows))]
@@ -122,19 +164,19 @@ macro_rules! define_bounded_tail_dispatch {
             HANDLERS[opcode as usize]
         }
 
-        $(handler_fn! {
+        $(bounded_handler_fn! {
             #[allow(non_snake_case, unreachable_code, unused_imports, unused_macros, unused_variables)]
             fn $variant(
                 $executor: &mut Executor<'_>,
                 $instr_ptr: usize,
                 instruction: Instruction,
                 instructions_until_checkpoint: u32,
-                height32: usize,
+                height32: BoundedHeight,
             ) -> ExecResult<()> {
                 macro_rules! $dispatch_next {
                     ($next_instr_ptr:expr) => {{
                         let next_instr_ptr = $next_instr_ptr;
-                        let height32 = $executor.value_stack.stack_32.len();
+                        let height32 = bounded_height($executor);
                         if instructions_until_checkpoint == 0 {
                             return cold!({
                                 $executor.cf.instr_ptr = next_instr_ptr;
@@ -167,7 +209,7 @@ macro_rules! define_bounded_tail_dispatch {
                 $(let $variant { $($field),* } = &instruction else {
                     become Self::handler_mismatch($executor, $instr_ptr, instruction, instructions_until_checkpoint, height32);
                 };)?
-                $executor.value_stack.stack_32.set_len(height32);
+                enter_bounded_height($executor, height32);
                 $body;
                 $dispatch_next!($instr_ptr + 1)
             }
@@ -203,18 +245,18 @@ impl Bounded {
 
     // Tail-called like `Unbudgeted`'s.
 
-    handler_fn! {
+    bounded_handler_fn! {
         #[cold]
         #[inline(never)]
-        fn handler_mismatch(_: &mut Executor<'_>, _: usize, _: Instruction, _: u32, _: usize) -> ExecResult<()> {
+        fn handler_mismatch(_: &mut Executor<'_>, _: usize, _: Instruction, _: u32, _: BoundedHeight) -> ExecResult<()> {
             unreachable!("instruction handler mismatch")
         }
     }
 
-    handler_fn! {
+    bounded_handler_fn! {
         #[cold]
         #[inline(never)]
-        fn invalid_instr_ptr(_: &mut Executor<'_>, instr_ptr: usize, _: Instruction, _: u32, _: usize) -> ExecResult<()> {
+        fn invalid_instr_ptr(_: &mut Executor<'_>, instr_ptr: usize, _: Instruction, _: u32, _: BoundedHeight) -> ExecResult<()> {
             unreachable!("instruction pointer {instr_ptr} out of range, this is a bug")
         }
     }
@@ -224,7 +266,7 @@ impl Bounded {
         let instr_ptr = executor.cf.instr_ptr;
         let instruction = executor.func.instructions[instr_ptr];
         let handler = Self::handler_for(instruction.opcode());
-        let height32 = executor.value_stack.stack_32.len();
+        let height32 = bounded_height(executor);
         handler(executor, instr_ptr, instruction, CHECKPOINT_INTERVAL - 1, height32)
     }
 }
