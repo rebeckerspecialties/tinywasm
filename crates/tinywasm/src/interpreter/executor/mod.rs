@@ -61,16 +61,6 @@ enum ExecFlow {
     Complete,
 }
 
-impl ExecFlow {
-    #[cfg(feature = "nightly-tail-calls")]
-    #[inline(always)]
-    fn next_instr_ptr(self) -> Option<usize> {
-        match self {
-            Self::Next(instr_ptr) | Self::Switch(instr_ptr) => Some(instr_ptr),
-            Self::Complete => None,
-        }
-    }
-}
 
 /// Runs frames of one module instance. The executing function is borrowed from the instance, which
 /// the caller keeps alive for the whole run, so calls and returns within the instance switch a
